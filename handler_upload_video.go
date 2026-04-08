@@ -1,13 +1,17 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -96,29 +100,37 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	// reset tempFile's file pointer to the beginning
 	// allows us to read the file again from the beginning
 	if _, err = tempFile.Seek(0, io.SeekStart); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Could not reset temp file pointer to beginning", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't reset temp file pointer to beginning", err)
+		return
+	}
+
+	// create processed version of video to upload to s3
+	outputFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video", err)
+		return
+	}
+	defer os.Remove(outputFilePath)
+	processedVideo, err := os.Open(outputFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open video file", err)
 		return
 	}
 
 	// put object into S3
-	base := make([]byte, 16)
-	if _, err = rand.Read(base); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't generate random bytes", err)
-		return
-	}
-	baseKey := hex.EncodeToString(base) + mediaTypeToExt(mediaType)
-	prefix := "other/"
+	key := getAssetPath(mediaType)
+	prefix := "other"
 	if aspectRatio == "9:16" {
-		prefix = "portrait/"
+		prefix = "portrait"
 	}
 	if aspectRatio == "16:9" {
-		prefix = "landscape/"
+		prefix = "landscape"
 	}
-	key := prefix + baseKey
+	key = path.Join(prefix, key)
 	params := s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tempFile,
+		Body:        processedVideo,
 		ContentType: aws.String(mediaType),
 	}
 	_, err = cfg.s3Client.PutObject(r.Context(), &params)
@@ -136,4 +148,71 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	// set cmd's Stdout field to a pointer to a new bytes.Buffer
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	// run the Command
+	if err := cmd.Run(); err != nil {
+		return "", errors.New("could not run the ffprobe command")
+	}
+
+	var output struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		return "", errors.New("could not unmarshal stdout")
+	}
+
+	if len(output.Streams) == 0 {
+		return "", errors.New("streams array empty")
+	}
+
+	width := output.Streams[0].Width
+	height := output.Streams[0].Height
+
+	ratio := float64(width) / float64(height)
+	if math.Abs(ratio-(16.0/9.0)) < 0.01 {
+		return "16:9", nil
+	}
+	if math.Abs(ratio-(9.0/16.0)) < 0.01 {
+		return "9:16", nil
+	}
+	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	// takes a file path as input and creates and returns a new path to a file
+	// with "fast start" encoding
+
+	outputFilePath := filePath + ".processing"
+
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error processing video: %s, %w", stderr.String(), err)
+	}
+
+	fileInfo, err := os.Stat(outputFilePath)
+	if err != nil {
+		return "", fmt.Errorf("could not stat processed file: %w", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty: %w", err)
+	}
+
+	return outputFilePath, nil
 }
