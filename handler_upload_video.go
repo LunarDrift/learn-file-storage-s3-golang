@@ -105,13 +105,13 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	// create processed version of video to upload to s3
-	outputFilePath, err := processVideoForFastStart(tempFile.Name())
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't process video", err)
 		return
 	}
-	defer os.Remove(outputFilePath)
-	processedVideo, err := os.Open(outputFilePath)
+	defer os.Remove(processedFilePath)
+	processedVideo, err := os.Open(processedFilePath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't open video file", err)
 		return
@@ -189,15 +189,14 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	return "other", nil
 }
 
+// takes a file path as input and creates and returns a new path to a file
+// with "fast start" encoding
 func processVideoForFastStart(filePath string) (string, error) {
-	// takes a file path as input and creates and returns a new path to a file
-	// with "fast start" encoding
-
-	outputFilePath := filePath + ".processing"
+	processedFilePath := filePath + ".processing"
 
 	cmd := exec.Command(
 		"ffmpeg",
-		"-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath,
+		"-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", processedFilePath,
 	)
 
 	var stderr bytes.Buffer
@@ -206,7 +205,7 @@ func processVideoForFastStart(filePath string) (string, error) {
 		return "", fmt.Errorf("error processing video: %s, %w", stderr.String(), err)
 	}
 
-	fileInfo, err := os.Stat(outputFilePath)
+	fileInfo, err := os.Stat(processedFilePath)
 	if err != nil {
 		return "", fmt.Errorf("could not stat processed file: %w", err)
 	}
@@ -214,5 +213,5 @@ func processVideoForFastStart(filePath string) (string, error) {
 		return "", fmt.Errorf("processed file is empty: %w", err)
 	}
 
-	return outputFilePath, nil
+	return processedFilePath, nil
 }
